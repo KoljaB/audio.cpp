@@ -584,7 +584,9 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
     auto silence_filter = LeadingSilenceFilter(parse_leading_silence_filter_config(body));
     bool started = false;
     std::lock_guard<std::mutex> lock(model.mutex);
-    model.session->prepare(engine::runtime::build_preparation_request(request));
+    auto preparation = engine::runtime::build_preparation_request(request);
+    preparation.text.reset();
+    model.session->prepare(preparation);
     (void) model.streaming_output->run_streaming_output(
         request,
         [&](const engine::runtime::StreamEvent & event) {
