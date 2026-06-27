@@ -116,12 +116,14 @@ std::string encode_pcm16_payload(const engine::runtime::AudioBuffer & audio) {
     if (audio.channels <= 0) {
         throw std::runtime_error("audio output channel count must be positive");
     }
-    std::string out;
-    out.reserve(audio.samples.size() * sizeof(int16_t));
-    for (float sample : audio.samples) {
+    std::string out(audio.samples.size() * sizeof(int16_t), '\0');
+    for (size_t i = 0; i < audio.samples.size(); ++i) {
+        float sample = audio.samples[i];
         sample = std::max(-1.0F, std::min(1.0F, sample));
         const auto pcm = static_cast<int16_t>(std::lrint(sample * 32767.0F));
-        out.append(reinterpret_cast<const char *>(&pcm), sizeof(pcm));
+        const auto bits = static_cast<uint16_t>(pcm);
+        out[2 * i] = static_cast<char>(bits & 0xff);
+        out[2 * i + 1] = static_cast<char>((bits >> 8) & 0xff);
     }
     return out;
 }
