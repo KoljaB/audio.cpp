@@ -112,17 +112,22 @@ std::vector<uint8_t> encode_pcm16_wav(const engine::runtime::AudioBuffer & audio
     return out;
 }
 
-std::string encode_pcm16_payload(const engine::runtime::AudioBuffer & audio) {
+void encode_pcm16_payload(const engine::runtime::AudioBuffer & audio, std::string & out) {
     if (audio.channels <= 0) {
         throw std::runtime_error("audio output channel count must be positive");
     }
-    std::string out;
+    out.clear();
     out.reserve(audio.samples.size() * sizeof(int16_t));
     for (float sample : audio.samples) {
         sample = std::max(-1.0F, std::min(1.0F, sample));
         const auto pcm = static_cast<int16_t>(std::lrint(sample * 32767.0F));
         out.append(reinterpret_cast<const char *>(&pcm), sizeof(pcm));
     }
+}
+
+std::string encode_pcm16_payload(const engine::runtime::AudioBuffer & audio) {
+    std::string out;
+    encode_pcm16_payload(audio, out);
     return out;
 }
 
@@ -582,6 +587,7 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
 
     const auto request = build_openai_speech_request(body, request_base_);
     auto silence_filter = LeadingSilenceFilter(parse_leading_silence_filter_config(body));
+    std::string pcm_scratch;
     bool started = false;
     std::lock_guard<std::mutex> lock(model.mutex);
     model.session->prepare(engine::runtime::build_preparation_request(request));
@@ -596,8 +602,8 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
                 return true;
             }
             const auto & audio = *filtered;
-            const auto chunk = encode_pcm16_payload(audio);
-            if (chunk.empty()) {
+            encode_pcm16_payload(audio, pcm_scratch);
+            if (pcm_scratch.empty()) {
                 return true;
             }
             if (!started) {
@@ -612,7 +618,7 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
                     });
                 started = true;
             }
-            responder.send_chunk(chunk);
+            responder.send_chunk(pcm_scratch);
             return true;
         });
     if (started) {
