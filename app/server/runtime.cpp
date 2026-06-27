@@ -582,7 +582,21 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
 
     const auto request = build_openai_speech_request(body, request_base_);
     auto silence_filter = LeadingSilenceFilter(parse_leading_silence_filter_config(body));
+    const double post_first_chunk_ms = std::max(
+        0.0,
+        static_cast<double>(engine::io::json::optional_f32(
+            body,
+            "stream_post_first_chunk_ms",
+            200.0F)));
+    std::string pending_chunk;
     bool started = false;
+    bool first_chunk_sent = false;
+    auto flush_pending = [&]() {
+        if (!pending_chunk.empty()) {
+            responder.send_chunk(pending_chunk);
+            pending_chunk.clear();
+        }
+    };
     std::lock_guard<std::mutex> lock(model.mutex);
     model.session->prepare(engine::runtime::build_preparation_request(request));
     (void) model.streaming_output->run_streaming_output(
@@ -612,10 +626,32 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
                     });
                 started = true;
             }
-            responder.send_chunk(chunk);
+            if (!first_chunk_sent) {
+                responder.send_chunk(chunk);
+                first_chunk_sent = true;
+                return true;
+            }
+            if (post_first_chunk_ms <= 0.0 || audio.sample_rate <= 0 || audio.channels <= 0) {
+                flush_pending();
+                responder.send_chunk(chunk);
+                return true;
+            }
+            pending_chunk.append(chunk);
+            const auto target_bytes = static_cast<size_t>(std::max<int64_t>(
+                1,
+                static_cast<int64_t>(std::llround(
+                    post_first_chunk_ms
+                    * static_cast<double>(audio.sample_rate)
+                    * static_cast<double>(audio.channels)
+                    * static_cast<double>(sizeof(int16_t))
+                    / 1000.0))));
+            if (pending_chunk.size() >= target_bytes) {
+                flush_pending();
+            }
             return true;
         });
     if (started) {
+        flush_pending();
         responder.finish_chunked();
     } else {
         responder.send_response(204, "application/octet-stream", "");
