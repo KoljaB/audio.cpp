@@ -514,6 +514,29 @@ FlowLMState PocketTTSSession::resolve_prepared_voice_state(const VoiceConditioni
     return cached->second;
 }
 
+TextConditioningResult PocketTTSSession::resolve_text_conditioning(const std::string & text) {
+    constexpr size_t kMaxCachedTextStates = 16;
+    auto cached = cached_text_states_.find(text);
+    if (cached != cached_text_states_.end()) {
+        cached_text_order_.erase(
+            std::remove(cached_text_order_.begin(), cached_text_order_.end(), text),
+            cached_text_order_.end());
+        cached_text_order_.push_back(text);
+        return cached->second;
+    }
+    if (!manifest_) {
+        throw std::runtime_error("PocketTTS session is missing model assets");
+    }
+    TextConditioningResult result = text_conditioner_.prepare(*manifest_, weights_->host, text);
+    cached_text_states_.emplace(text, result);
+    cached_text_order_.push_back(text);
+    while (cached_text_order_.size() > kMaxCachedTextStates) {
+        cached_text_states_.erase(cached_text_order_.front());
+        cached_text_order_.pop_front();
+    }
+    return result;
+}
+
 PocketTTSGraphCapacityConfig PocketTTSSession::resolve_graph_capacity_config() const {
     const runtime::GraphCapacityMode default_mode = core::requested_backend_uses_host_graph_plan(options().backend)
         ? runtime::GraphCapacityMode::Tiered
@@ -796,7 +819,7 @@ void PocketTTSSession::prepare_generation(const GenerationRequest & request) {
     const int64_t text_chunk_size = request.text_chunk_size.value_or(kDefaultTextChunkSize);
     const auto chunks = engine::text::split_text_chunks(request.text, text_chunk_size);
     for (const auto & chunk : chunks) {
-        const TextConditioningResult text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
+        const TextConditioningResult text_state = resolve_text_conditioning(chunk);
         const AcousticGenerationConfig acoustic_config = resolve_acoustic_generation_config(
             manifest,
             text_state,
@@ -856,7 +879,7 @@ GenerationResult PocketTTSSession::generate(
         }
         TextConditioningResult text_state;
         text_conditioner_ms += engine::debug::measure_ms([&]() {
-            text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
+            text_state = resolve_text_conditioning(chunk);
         });
         const AcousticGenerationConfig acoustic_config = resolve_acoustic_generation_config(
             manifest,

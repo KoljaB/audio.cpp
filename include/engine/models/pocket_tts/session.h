@@ -9,6 +9,7 @@
 #include "engine/models/pocket_tts/voice_conditioner.h"
 
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -78,6 +79,7 @@ private:
     runtime::MappedGraphCapacityAdapter make_prompt_capacity_adapter() const;
     runtime::MappedGraphCapacityAdapter make_generation_capacity_adapter() const;
     AcousticCapacitySelection select_acoustic_capacities(int64_t prompt_steps, int max_steps) const;
+    TextConditioningResult resolve_text_conditioning(const std::string & text);
     std::vector<int64_t> prepared_prompt_capacities() const;
     std::vector<int64_t> prepared_generation_capacities() const;
 
@@ -91,6 +93,8 @@ private:
     AcousticModel acoustic_model_;
     AudioDecoder audio_decoder_;
     std::map<std::string, FlowLMState> cached_voice_states_;
+    std::map<std::string, TextConditioningResult> cached_text_states_;
+    std::deque<std::string> cached_text_order_;
     GenerationRequest prepared_session_request_;
     runtime::GraphCapacityController prompt_capacity_controller_;
     runtime::GraphCapacityController generation_capacity_controller_;
