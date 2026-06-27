@@ -758,7 +758,7 @@ runtime::TaskResult PocketTTSSession::run_streaming_output(
     generation_request.noise_schedule_path = prepared_session_request_.noise_schedule_path;
     generation_request.voice = prepared_session_request_.voice;
 
-    const GenerationResult generated = generate(
+    (void) generate(
         generation_request,
         [&](const runtime::AudioBuffer & chunk) {
             if (!on_event) {
@@ -774,13 +774,7 @@ runtime::TaskResult PocketTTSSession::run_streaming_output(
         (void) on_event(final_event);
     }
 
-    runtime::TaskResult result;
-    result.audio_output = runtime::AudioBuffer{
-        generated.sample_rate,
-        1,
-        generated.audio,
-    };
-    return result;
+    return runtime::TaskResult{};
 }
 
 void PocketTTSSession::prepare_generation(const GenerationRequest & request) {
@@ -909,7 +903,6 @@ GenerationResult PocketTTSSession::generate(
                                 graph_capacity_.mimi_transformer_graph_context_bytes,
                                 graph_capacity_.mimi_tail_graph_context_bytes);
                             if (!samples.empty()) {
-                                chunk_audio.insert(chunk_audio.end(), samples.begin(), samples.end());
                                 runtime::AudioBuffer audio_chunk;
                                 audio_chunk.sample_rate = manifest.model_config.sample_rate;
                                 audio_chunk.channels = 1;
@@ -948,7 +941,9 @@ GenerationResult PocketTTSSession::generate(
                     graph_capacity_.mimi_use_full_sequence_path);
             });
         }
-        audio.insert(audio.end(), chunk_audio.begin(), chunk_audio.end());
+        if (!chunk_audio.empty()) {
+            audio.insert(audio.end(), chunk_audio.begin(), chunk_audio.end());
+        }
     }
 
     const auto ended_inference = std::chrono::steady_clock::now();
