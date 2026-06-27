@@ -12,6 +12,7 @@ namespace engine::models::pocket_tts {
 
 struct PocketTTSAssets;
 struct PocketTTSBackendWeights;
+class AudioDecoder;
 
 using AudioSamplesCallback = std::function<bool(const std::vector<float> & samples)>;
 
@@ -36,11 +37,13 @@ public:
     MimiDecoderStream & operator=(const MimiDecoderStream &) = delete;
 
 private:
+    friend class AudioDecoder;
     friend class MimiDecoder;
 
     struct State;
 
     explicit MimiDecoderStream(std::unique_ptr<State> state);
+    std::vector<float> & denormalization_scratch();
 
     std::unique_ptr<State> state_;
 };

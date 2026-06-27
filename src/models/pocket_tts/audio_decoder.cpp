@@ -8,16 +8,25 @@
 namespace engine::models::pocket_tts {
 namespace {
 
+void denormalize_latents(
+    const std::vector<float> & latents,
+    const std::vector<float> & mean,
+    const std::vector<float> & std,
+    std::vector<float> & output) {
+    output.resize(latents.size());
+    const size_t dim = mean.size();
+    for (size_t i = 0; i < output.size(); ++i) {
+        const size_t d = i % dim;
+        output[i] = latents[i] * std[d] + mean[d];
+    }
+}
+
 std::vector<float> denormalize_latents(
     const std::vector<float> & latents,
     const std::vector<float> & mean,
     const std::vector<float> & std) {
-    std::vector<float> output = latents;
-    const size_t dim = mean.size();
-    for (size_t i = 0; i < output.size(); ++i) {
-        const size_t d = i % dim;
-        output[i] = output[i] * std[d] + mean[d];
-    }
+    std::vector<float> output;
+    denormalize_latents(latents, mean, std, output);
     return output;
 }
 
@@ -47,7 +56,8 @@ std::vector<float> AudioDecoder::decode_streaming_step(
     if (emb_mean.size() != emb_std.size() || emb_mean.size() != static_cast<size_t>(decoder_.config().latent_size)) {
         throw std::runtime_error("PocketTTS latent normalization stats must match Mimi latent_size");
     }
-    auto denormalized = denormalize_latents(latent, emb_mean, emb_std);
+    auto & denormalized = stream.denormalization_scratch();
+    denormalize_latents(latent, emb_mean, emb_std, denormalized);
     return decoder_.decode_streaming_step(
         backend,
         threads,

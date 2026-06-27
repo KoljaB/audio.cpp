@@ -1267,6 +1267,7 @@ struct MimiDecoder::RuntimeCache {
 
 struct MimiDecoderStream::State {
     DecoderState decoder_state;
+    std::vector<float> denormalization_scratch;
     bool transformer_sequence_initialized = false;
 };
 
@@ -1280,6 +1281,13 @@ MimiDecoderStream::~MimiDecoderStream() = default;
 MimiDecoderStream::MimiDecoderStream(MimiDecoderStream &&) noexcept = default;
 
 MimiDecoderStream & MimiDecoderStream::operator=(MimiDecoderStream &&) noexcept = default;
+
+std::vector<float> & MimiDecoderStream::denormalization_scratch() {
+    if (!state_) {
+        throw std::runtime_error("PocketTTS Mimi decoder stream is not initialized");
+    }
+    return state_->denormalization_scratch;
+}
 
 MimiDecoder::MimiDecoder(MimiDecoderConfig config) : config_(std::move(config)) {}
 
