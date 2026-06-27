@@ -86,12 +86,15 @@ Set `"response_format": "json"` to receive base64 WAV in a JSON response.
 
 OpenAI-style text-to-audio with chunked audio output. The response uses HTTP chunked transfer encoding and streams raw signed 16-bit little-endian PCM chunks as soon as the model session produces decoder audio.
 
+The stream endpoint trims leading silence by default before it sends the first PCM chunk. PocketTTS commonly emits silent decoder chunks at the start of a generation, and dropping them lowers first audible audio latency without changing the generated speech content. Set `"trim_leading_silence": false` in the request body to receive the raw stream.
+
 The response headers describe the stream:
 
 - `Content-Type: application/octet-stream`
 - `X-Audio-Format: pcm_s16le`
 - `X-Audio-Sample-Rate: <sample-rate>`
 - `X-Audio-Channels: <channel-count>`
+- `X-Audio-Leading-Silence-Dropped-Ms: <milliseconds>`
 
 ```bash
 curl http://127.0.0.1:8080/v1/audio/speech/stream \
@@ -101,6 +104,7 @@ curl http://127.0.0.1:8080/v1/audio/speech/stream \
     "model": "pocket-tts",
     "input": "audio.cpp is streaming decoder audio through the server.",
     "voice_ref": "/path/to/reference.wav",
+    "trim_leading_silence": true,
     "max_tokens": 96,
     "seed": 1234
   }'

@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -122,6 +124,145 @@ std::string encode_pcm16_payload(const engine::runtime::AudioBuffer & audio) {
         out.append(reinterpret_cast<const char *>(&pcm), sizeof(pcm));
     }
     return out;
+}
+
+struct LeadingSilenceFilterConfig {
+    bool enabled = true;
+    float threshold = 80.0F / 32767.0F;
+    double preroll_ms = 20.0;
+    double scan_window_ms = 5.0;
+    double min_trim_ms = 10.0;
+    double fade_ms = 25.0;
+};
+
+class LeadingSilenceFilter {
+public:
+    explicit LeadingSilenceFilter(LeadingSilenceFilterConfig config) : config_(config) {}
+
+    std::optional<engine::runtime::AudioBuffer> process(const engine::runtime::AudioBuffer & audio) {
+        if (!config_.enabled || started_) {
+            return audio;
+        }
+        if (audio.sample_rate <= 0) {
+            throw std::runtime_error("stream audio sample rate must be positive");
+        }
+        if (audio.channels <= 0) {
+            throw std::runtime_error("stream audio channel count must be positive");
+        }
+        if (audio.samples.size() % static_cast<size_t>(audio.channels) != 0) {
+            throw std::runtime_error("stream audio sample count must be divisible by channel count");
+        }
+        if (audio.samples.empty()) {
+            return std::nullopt;
+        }
+
+        const int64_t frames = static_cast<int64_t>(audio.samples.size() / static_cast<size_t>(audio.channels));
+        if (average_abs(audio.samples, 0, frames, audio.channels) < config_.threshold) {
+            dropped_frames_ += frames;
+            return std::nullopt;
+        }
+
+        engine::runtime::AudioBuffer output = audio;
+        const int64_t trim_frames = find_trim_frames(output.samples, frames, output.channels, output.sample_rate);
+        if (trim_frames > 0) {
+            output.samples.erase(
+                output.samples.begin(),
+                output.samples.begin() + static_cast<std::ptrdiff_t>(trim_frames * output.channels));
+            dropped_frames_ += trim_frames;
+        }
+        if (dropped_frames_ > 0) {
+            apply_fade_in(output);
+        }
+        started_ = true;
+        return output;
+    }
+
+    double dropped_ms(int sample_rate) const {
+        if (sample_rate <= 0) {
+            return 0.0;
+        }
+        return static_cast<double>(dropped_frames_) * 1000.0 / static_cast<double>(sample_rate);
+    }
+
+private:
+    static float average_abs(
+        const std::vector<float> & samples,
+        int64_t start_frame,
+        int64_t frame_count,
+        int channels) {
+        if (frame_count <= 0 || channels <= 0) {
+            return 0.0F;
+        }
+        double sum = 0.0;
+        const int64_t start = start_frame * channels;
+        const int64_t end = start + frame_count * channels;
+        for (int64_t index = start; index < end; ++index) {
+            sum += std::abs(static_cast<double>(samples[static_cast<size_t>(index)]));
+        }
+        return static_cast<float>(sum / static_cast<double>(frame_count * channels));
+    }
+
+    int64_t find_trim_frames(
+        const std::vector<float> & samples,
+        int64_t frames,
+        int channels,
+        int sample_rate) const {
+        const int64_t window_frames = std::max<int64_t>(
+            1,
+            static_cast<int64_t>(std::llround(static_cast<double>(sample_rate) * config_.scan_window_ms / 1000.0)));
+        const int64_t preroll_frames = std::max<int64_t>(
+            0,
+            static_cast<int64_t>(std::llround(static_cast<double>(sample_rate) * config_.preroll_ms / 1000.0)));
+
+        for (int64_t start = 0; start < frames; start += window_frames) {
+            const int64_t count = std::min<int64_t>(window_frames, frames - start);
+            if (average_abs(samples, start, count, channels) >= config_.threshold) {
+                const int64_t trim = std::max<int64_t>(0, start - preroll_frames);
+                const double trim_ms = static_cast<double>(trim) * 1000.0 / static_cast<double>(sample_rate);
+                return trim_ms >= config_.min_trim_ms ? trim : 0;
+            }
+        }
+        return 0;
+    }
+
+    void apply_fade_in(engine::runtime::AudioBuffer & audio) const {
+        if (audio.samples.empty() || audio.sample_rate <= 0 || audio.channels <= 0) {
+            return;
+        }
+        const int64_t frames = static_cast<int64_t>(audio.samples.size() / static_cast<size_t>(audio.channels));
+        const int64_t fade_frames = std::min<int64_t>(
+            frames,
+            std::max<int64_t>(
+                1,
+                static_cast<int64_t>(std::llround(static_cast<double>(audio.sample_rate) * config_.fade_ms / 1000.0))));
+        for (int64_t frame = 0; frame < fade_frames; ++frame) {
+            const float gain = static_cast<float>(frame + 1) / static_cast<float>(fade_frames);
+            for (int channel = 0; channel < audio.channels; ++channel) {
+                audio.samples[static_cast<size_t>(frame * audio.channels + channel)] *= gain;
+            }
+        }
+    }
+
+    LeadingSilenceFilterConfig config_;
+    bool started_ = false;
+    int64_t dropped_frames_ = 0;
+};
+
+LeadingSilenceFilterConfig parse_leading_silence_filter_config(const Value & body) {
+    LeadingSilenceFilterConfig config;
+    config.enabled = engine::io::json::optional_bool(body, "trim_leading_silence", true);
+    config.threshold = engine::io::json::optional_f32(body, "leading_silence_threshold", config.threshold);
+    config.preroll_ms = engine::io::json::optional_f32(body, "leading_silence_preroll_ms", static_cast<float>(config.preroll_ms));
+    config.scan_window_ms = engine::io::json::optional_f32(
+        body,
+        "leading_silence_scan_window_ms",
+        static_cast<float>(config.scan_window_ms));
+    config.min_trim_ms = engine::io::json::optional_f32(
+        body,
+        "leading_silence_min_trim_ms",
+        static_cast<float>(config.min_trim_ms));
+    config.fade_ms = engine::io::json::optional_f32(body, "leading_silence_fade_ms", static_cast<float>(config.fade_ms));
+    return config;
 }
 
 std::string base64_encode(const uint8_t * data, size_t size) {
@@ -440,6 +581,7 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
     }
 
     const auto request = build_openai_speech_request(body, request_base_);
+    auto silence_filter = LeadingSilenceFilter(parse_leading_silence_filter_config(body));
     bool started = false;
     std::lock_guard<std::mutex> lock(model.mutex);
     model.session->prepare(engine::runtime::build_preparation_request(request));
@@ -449,7 +591,11 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
             if (!event.audio_output.has_value()) {
                 return true;
             }
-            const auto & audio = *event.audio_output;
+            auto filtered = silence_filter.process(*event.audio_output);
+            if (!filtered.has_value() || filtered->samples.empty()) {
+                return true;
+            }
+            const auto & audio = *filtered;
             const auto chunk = encode_pcm16_payload(audio);
             if (chunk.empty()) {
                 return true;
@@ -462,6 +608,7 @@ void ServerState::handle_speech_stream(const std::string & body_text, HttpRespon
                         {"X-Audio-Format", "pcm_s16le"},
                         {"X-Audio-Sample-Rate", std::to_string(audio.sample_rate)},
                         {"X-Audio-Channels", std::to_string(audio.channels)},
+                        {"X-Audio-Leading-Silence-Dropped-Ms", std::to_string(silence_filter.dropped_ms(audio.sample_rate))},
                     });
                 started = true;
             }
