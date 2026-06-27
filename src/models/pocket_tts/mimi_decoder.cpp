@@ -1265,6 +1265,22 @@ struct MimiDecoder::RuntimeCache {
     int64_t full_output_runtime_frames = -1;
 };
 
+struct MimiDecoderStream::State {
+    DecoderState decoder_state;
+    bool transformer_sequence_initialized = false;
+};
+
+MimiDecoderStream::MimiDecoderStream() = default;
+
+MimiDecoderStream::MimiDecoderStream(std::unique_ptr<State> state)
+    : state_(std::move(state)) {}
+
+MimiDecoderStream::~MimiDecoderStream() = default;
+
+MimiDecoderStream::MimiDecoderStream(MimiDecoderStream &&) noexcept = default;
+
+MimiDecoderStream & MimiDecoderStream::operator=(MimiDecoderStream &&) noexcept = default;
+
 MimiDecoder::MimiDecoder(MimiDecoderConfig config) : config_(std::move(config)) {}
 
 MimiDecoder::~MimiDecoder() {
@@ -1273,6 +1289,370 @@ MimiDecoder::~MimiDecoder() {
 
 const MimiDecoderConfig & MimiDecoder::config() const noexcept {
     return config_;
+}
+
+MimiDecoderStream MimiDecoder::create_stream() const {
+    auto state = std::make_unique<MimiDecoderStream::State>();
+    state->decoder_state = make_decoder_state(config_);
+    return MimiDecoderStream(std::move(state));
+}
+
+std::vector<float> MimiDecoder::decode_streaming_step(
+    ggml_backend_t backend,
+    int threads,
+    const models::pocket_tts::PocketTTSAssets & manifest,
+    const models::pocket_tts::PocketTTSBackendWeights & weights,
+    MimiDecoderStream & stream,
+    const std::vector<float> & latent,
+    size_t conv_graph_context_bytes,
+    size_t transformer_graph_context_bytes,
+    size_t tail_graph_context_bytes) const {
+    if (!stream.state_) {
+        throw std::runtime_error("PocketTTS Mimi decoder stream is not initialized");
+    }
+    if (latent.size() != static_cast<size_t>(config_.latent_size)) {
+        throw std::runtime_error("PocketTTS Mimi decoder streaming latent must match latent_size");
+    }
+
+    auto & runtime_cache = runtime_cache_;
+    if (!runtime_cache || runtime_cache->manifest != &manifest || runtime_cache->backend != backend || runtime_cache->threads != threads
+        || runtime_cache->conv_graph_context_bytes != conv_graph_context_bytes
+        || runtime_cache->transformer_graph_context_bytes != transformer_graph_context_bytes
+        || runtime_cache->tail_graph_context_bytes != tail_graph_context_bytes) {
+        runtime_cache = std::make_unique<RuntimeCache>();
+        runtime_cache->manifest = &manifest;
+        runtime_cache->backend = backend;
+        runtime_cache->threads = threads;
+        runtime_cache->conv_graph_context_bytes = conv_graph_context_bytes;
+        runtime_cache->transformer_graph_context_bytes = transformer_graph_context_bytes;
+        runtime_cache->tail_graph_context_bytes = tail_graph_context_bytes;
+    }
+
+    auto & cache = *runtime_cache;
+    auto & state = stream.state_->decoder_state;
+    const auto & decoder_weights = weights.mimi_decoder;
+    const auto & quantizer_weight = decoder_weights.quantizer_output_proj_weight;
+    const auto & encoder_upsample_weight = decoder_weights.encoder_upsample_weight;
+    const auto & input_projection = decoder_weights.input_projection;
+    const auto & stage0_upsample = decoder_weights.stage0_upsample;
+    const auto & stage1_upsample = decoder_weights.stage1_upsample;
+    const auto & stage2_upsample = decoder_weights.stage2_upsample;
+    const auto & output_projection = decoder_weights.output_projection;
+    auto & quantizer_runtime = cache.quantizer_runtime;
+    auto & transformer_runtime = cache.transformer_runtime;
+    auto & input_projection_runtime = cache.input_projection_runtime;
+    auto & stage0_upsample_runtime = cache.stage0_upsample_runtime;
+    auto & stage0_conv1_runtime = cache.stage0_conv1_runtime;
+    auto & stage0_conv2_runtime = cache.stage0_conv2_runtime;
+    auto & stage1_upsample_runtime = cache.stage1_upsample_runtime;
+    auto & stage1_conv1_runtime = cache.stage1_conv1_runtime;
+    auto & stage1_conv2_runtime = cache.stage1_conv2_runtime;
+    auto & stage2_upsample_runtime = cache.stage2_upsample_runtime;
+    auto & stage2_conv1_runtime = cache.stage2_conv1_runtime;
+    auto & stage2_conv2_runtime = cache.stage2_conv2_runtime;
+    auto & output_projection_runtime = cache.output_projection_runtime;
+    auto & resblock_conv1_frames = cache.resblock_conv1_frames;
+    auto & resblock_conv2_frames = cache.resblock_conv2_frames;
+
+    auto run_resblock = [&](DecoderState & state_ref,
+                            const std::vector<float> & input_bct,
+                            int64_t channels,
+                            int64_t hidden_channels,
+                            int stage_index,
+                            std::unique_ptr<Conv1dRuntime> & conv1_runtime,
+                            std::unique_ptr<Conv1dRuntime> & conv2_runtime,
+                            const PocketTTSBackendResidualBlockWeights & block_weights) {
+        const int64_t frames_bct = static_cast<int64_t>(input_bct.size()) / channels;
+        const int64_t conv1_needed_frames =
+            frames_bct + state_ref.stage_residual_convs[static_cast<size_t>(stage_index)][0].history_frames;
+        if (!conv1_runtime || resblock_conv1_frames[static_cast<size_t>(stage_index)] != conv1_needed_frames) {
+            conv1_runtime = std::make_unique<Conv1dRuntime>(
+                backend,
+                weights.backend_type,
+                threads,
+                conv_graph_context_bytes,
+                block_weights.conv1.weight,
+                block_weights.conv1.bias,
+                channels,
+                conv1_needed_frames,
+                hidden_channels,
+                3,
+                1,
+                1);
+            resblock_conv1_frames[static_cast<size_t>(stage_index)] = conv1_needed_frames;
+        }
+        const int64_t conv2_needed_frames =
+            frames_bct + state_ref.stage_residual_convs[static_cast<size_t>(stage_index)][1].history_frames;
+        if (!conv2_runtime || resblock_conv2_frames[static_cast<size_t>(stage_index)] != conv2_needed_frames) {
+            conv2_runtime = std::make_unique<Conv1dRuntime>(
+                backend,
+                weights.backend_type,
+                threads,
+                conv_graph_context_bytes,
+                block_weights.conv2.weight,
+                block_weights.conv2.bias,
+                hidden_channels,
+                conv2_needed_frames,
+                channels,
+                1,
+                1,
+                1);
+            resblock_conv2_frames[static_cast<size_t>(stage_index)] = conv2_needed_frames;
+        }
+        auto x = elu(input_bct);
+        x = run_streaming_conv1d_step(
+            *conv1_runtime,
+            x,
+            channels,
+            frames_bct,
+            hidden_channels,
+            3,
+            1,
+            1,
+            modules::StreamingPadMode::Constant,
+            state_ref.stage_residual_convs[static_cast<size_t>(stage_index)][0]);
+        x = elu(x);
+        x = run_streaming_conv1d_step(
+            *conv2_runtime,
+            x,
+            hidden_channels,
+            frames_bct,
+            channels,
+            1,
+            1,
+            1,
+            modules::StreamingPadMode::Constant,
+            state_ref.stage_residual_convs[static_cast<size_t>(stage_index)][1]);
+        return add_bct(input_bct, x);
+    };
+
+    if (!quantizer_runtime || cache.quantizer_steps != 1) {
+        quantizer_runtime = std::make_unique<Conv1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            quantizer_weight,
+            std::nullopt,
+            config_.latent_size,
+            1,
+            config_.hidden_size,
+            1,
+            1,
+            1);
+        cache.quantizer_steps = 1;
+    }
+    if (!cache.encoder_rate_upsample_runtime || cache.encoder_rate_upsample_steps != 1) {
+        cache.encoder_rate_upsample_runtime = std::make_unique<DepthwiseConvTranspose1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            encoder_upsample_weight,
+            1,
+            config_.hidden_size,
+            config_.encoder_upsample_stride * 2,
+            static_cast<int>(config_.encoder_upsample_stride));
+        cache.encoder_rate_upsample_steps = 1;
+    }
+    auto & encoder_rate_upsample_runtime = *cache.encoder_rate_upsample_runtime;
+
+    auto x = quantizer_runtime->run(latent);
+    x = run_depthwise_convtranspose1d_step(
+        encoder_rate_upsample_runtime,
+        x,
+        config_.hidden_size,
+        1,
+        config_.encoder_upsample_stride * 2,
+        static_cast<int>(config_.encoder_upsample_stride),
+        state.encoder_rate_upsample);
+    const int64_t encoder_frames = static_cast<int64_t>(x.size()) / config_.hidden_size;
+    if (!transformer_runtime || cache.transformer_frames != encoder_frames) {
+        transformer_runtime = std::make_unique<MimiTransformerRuntime>(
+            backend,
+            threads,
+            transformer_graph_context_bytes,
+            weights,
+            config_,
+            encoder_frames,
+            250);
+        cache.transformer_frames = encoder_frames;
+    }
+    if (!stream.state_->transformer_sequence_initialized) {
+        transformer_runtime->reset_sequence(state.transformer.current_end);
+        stream.state_->transformer_sequence_initialized = true;
+    }
+    x = transformer_runtime->run(x).output_bct;
+    const int64_t needed_input_frames = encoder_frames + state.input_projection.history_frames;
+    if (!input_projection_runtime || cache.input_projection_frames != needed_input_frames) {
+        input_projection_runtime = std::make_unique<Conv1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            input_projection.weight,
+            input_projection.bias,
+            config_.hidden_size,
+            needed_input_frames,
+            config_.hidden_size,
+            7,
+            1,
+            1);
+        cache.input_projection_frames = needed_input_frames;
+    }
+    x = run_streaming_conv1d_step(
+        *input_projection_runtime,
+        x,
+        config_.hidden_size,
+        encoder_frames,
+        config_.hidden_size,
+        7,
+        1,
+        1,
+        modules::StreamingPadMode::Constant,
+        state.input_projection);
+
+    x = elu(x);
+    if (!stage0_upsample_runtime || cache.stage0_upsample_frames != encoder_frames) {
+        stage0_upsample_runtime = std::make_unique<ConvTranspose1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            stage0_upsample.weight,
+            stage0_upsample.bias,
+            config_.hidden_size,
+            encoder_frames,
+            256,
+            12,
+            6);
+        cache.stage0_upsample_frames = encoder_frames;
+    }
+    x = run_streaming_convtranspose1d_step(
+        *stage0_upsample_runtime,
+        x,
+        config_.hidden_size,
+        encoder_frames,
+        256,
+        12,
+        6,
+        decoder_weights.stage0_upsample_bias_values,
+        state.stage_upsamples[0]);
+    x = run_resblock(
+        state,
+        x,
+        256,
+        128,
+        0,
+        stage0_conv1_runtime,
+        stage0_conv2_runtime,
+        decoder_weights.stage0_block);
+
+    const int64_t stage1_frames = static_cast<int64_t>(x.size()) / 256;
+    x = elu(x);
+    if (!stage1_upsample_runtime || cache.stage1_upsample_frames != stage1_frames) {
+        stage1_upsample_runtime = std::make_unique<ConvTranspose1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            stage1_upsample.weight,
+            stage1_upsample.bias,
+            256,
+            stage1_frames,
+            128,
+            10,
+            5);
+        cache.stage1_upsample_frames = stage1_frames;
+    }
+    x = run_streaming_convtranspose1d_step(
+        *stage1_upsample_runtime,
+        x,
+        256,
+        stage1_frames,
+        128,
+        10,
+        5,
+        decoder_weights.stage1_upsample_bias_values,
+        state.stage_upsamples[1]);
+    x = run_resblock(
+        state,
+        x,
+        128,
+        64,
+        1,
+        stage1_conv1_runtime,
+        stage1_conv2_runtime,
+        decoder_weights.stage1_block);
+
+    const int64_t stage2_frames = static_cast<int64_t>(x.size()) / 128;
+    x = elu(x);
+    if (!stage2_upsample_runtime || cache.stage2_upsample_frames != stage2_frames) {
+        stage2_upsample_runtime = std::make_unique<ConvTranspose1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            stage2_upsample.weight,
+            stage2_upsample.bias,
+            128,
+            stage2_frames,
+            64,
+            8,
+            4);
+        cache.stage2_upsample_frames = stage2_frames;
+    }
+    x = run_streaming_convtranspose1d_step(
+        *stage2_upsample_runtime,
+        x,
+        128,
+        stage2_frames,
+        64,
+        8,
+        4,
+        decoder_weights.stage2_upsample_bias_values,
+        state.stage_upsamples[2]);
+    x = run_resblock(
+        state,
+        x,
+        64,
+        32,
+        2,
+        stage2_conv1_runtime,
+        stage2_conv2_runtime,
+        decoder_weights.stage2_block);
+
+    const int64_t output_frames = static_cast<int64_t>(x.size()) / 64;
+    x = elu(x);
+    const int64_t needed_output_frames = output_frames + state.output_projection.history_frames;
+    if (!output_projection_runtime || cache.output_projection_frames != needed_output_frames) {
+        output_projection_runtime = std::make_unique<Conv1dRuntime>(
+            backend,
+            weights.backend_type,
+            threads,
+            conv_graph_context_bytes,
+            output_projection.weight,
+            output_projection.bias,
+            64,
+            needed_output_frames,
+            1,
+            3,
+            1,
+            1);
+        cache.output_projection_frames = needed_output_frames;
+    }
+    x = run_streaming_conv1d_step(
+        *output_projection_runtime,
+        x,
+        64,
+        output_frames,
+        1,
+        3,
+        1,
+        1,
+        modules::StreamingPadMode::Constant,
+        state.output_projection);
+    return x;
 }
 
 std::vector<float> MimiDecoder::decode(
@@ -1287,7 +1667,8 @@ std::vector<float> MimiDecoder::decode(
     size_t tail_graph_context_bytes,
     int64_t full_chunk_frames,
     int64_t stage2_chunk_frames,
-    bool use_full_sequence_path) const {
+    bool use_full_sequence_path,
+    AudioSamplesCallback on_audio_samples) const {
     const auto decode_started = std::chrono::steady_clock::now();
     if (steps <= 0) {
         throw std::runtime_error("PocketTTS Mimi decoder requires positive step count");
@@ -1335,6 +1716,12 @@ std::vector<float> MimiDecoder::decode(
     auto & resblock_conv2_frames = cache.resblock_conv2_frames;
     std::vector<float> audio;
     audio.reserve(static_cast<size_t>(steps) * 1920);
+    auto emit_audio_samples = [&](const std::vector<float> & samples) {
+        if (!on_audio_samples || samples.empty()) {
+            return true;
+        }
+        return on_audio_samples(samples);
+    };
 
     auto run_resblock = [&](DecoderState & state_ref,
                             const std::vector<float> & input_bct,
@@ -1686,6 +2073,9 @@ std::vector<float> MimiDecoder::decode(
                             decoder_state.output_projection);
                     });
                     audio.insert(audio.end(), chunk_audio.begin(), chunk_audio.end());
+                    if (!emit_audio_samples(chunk_audio)) {
+                        return audio;
+                    }
                 }
             }
 
@@ -1726,6 +2116,7 @@ std::vector<float> MimiDecoder::decode(
         trace.tail_graph_ms = engine::debug::measure_ms([&]() {
             audio = cache.full_decoder_runtime->run(latents_bct);
         });
+        (void) emit_audio_samples(audio);
         engine::debug::timing_log_scalar("pocket_tts.mimi.full.single.graph.total_ms", trace.tail_graph_ms);
 
         const double decode_ms = engine::debug::elapsed_ms(decode_started);
@@ -1977,6 +2368,9 @@ std::vector<float> MimiDecoder::decode(
             modules::StreamingPadMode::Constant,
             state.output_projection);
         audio.insert(audio.end(), x.begin(), x.end());
+        if (!emit_audio_samples(x)) {
+            return audio;
+        }
     }
 
     const double decode_ms = engine::debug::elapsed_ms(decode_started);

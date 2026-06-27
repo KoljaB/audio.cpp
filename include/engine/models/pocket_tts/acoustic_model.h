@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -29,6 +30,11 @@ struct AcousticModelResult {
     std::vector<float> latents;
     std::vector<float> eos_logits;
 };
+
+using AcousticLatentCallback = std::function<bool(
+    const std::vector<float> & latent,
+    float eos_logit,
+    int step)>;
 
 struct AcousticPreparedRuntime {
     int64_t prompt_steps = 0;
@@ -61,7 +67,8 @@ public:
         const PocketTTSBackendWeights & weights,
         const std::vector<float> & text_embeddings,
         const FlowLMState & initial_state,
-        const AcousticGenerationConfig & config) const;
+        const AcousticGenerationConfig & config,
+        AcousticLatentCallback on_latent = {}) const;
 
     void clear_runtime_cache() const noexcept;
     int64_t prepared_prompt_capacity() const noexcept;

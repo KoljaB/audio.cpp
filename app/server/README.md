@@ -1,6 +1,6 @@
 # audio.cpp Server
 
-`audiocpp_server` is a CUDA-only HTTP adapter over the framework runtime registry. It keeps one loaded model and one offline task session per configured model id, so repeated HTTP requests reuse the same framework session and model-owned graph/cache state.
+`audiocpp_server` is an HTTP adapter over the framework runtime registry. It keeps one loaded model and one task session per configured model id, so repeated HTTP requests reuse the same framework session and model-owned graph/cache state.
 
 ## Build
 
@@ -16,6 +16,7 @@ cat > server.json <<'JSON'
 {
   "host": "127.0.0.1",
   "port": 8080,
+  "backend": "cuda",
   "device": 0,
   "threads": 1,
   "models": [
@@ -80,6 +81,30 @@ curl http://127.0.0.1:8080/v1/audio/speech \
 ```
 
 Set `"response_format": "json"` to receive base64 WAV in a JSON response.
+
+### `POST /v1/audio/speech/stream`
+
+OpenAI-style text-to-audio with chunked audio output. The response uses HTTP chunked transfer encoding and streams raw signed 16-bit little-endian PCM chunks as soon as the model session produces decoder audio.
+
+The response headers describe the stream:
+
+- `Content-Type: application/octet-stream`
+- `X-Audio-Format: pcm_s16le`
+- `X-Audio-Sample-Rate: <sample-rate>`
+- `X-Audio-Channels: <channel-count>`
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/speech/stream \
+  -H 'Content-Type: application/json' \
+  -o out.pcm \
+  -d '{
+    "model": "pocket-tts",
+    "input": "audio.cpp is streaming decoder audio through the server.",
+    "voice_ref": "/path/to/reference.wav",
+    "max_tokens": 96,
+    "seed": 1234
+  }'
+```
 
 ### `POST /v1/audio/transcriptions`
 

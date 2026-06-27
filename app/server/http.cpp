@@ -54,6 +54,8 @@ const char * status_text(int status) noexcept {
     switch (status) {
     case 200:
         return "OK";
+    case 204:
+        return "No Content";
     case 400:
         return "Bad Request";
     case 404:
@@ -65,6 +67,16 @@ const char * status_text(int status) noexcept {
     default:
         return "Error";
     }
+}
+
+std::unordered_map<std::string, std::string> cors_headers() {
+    return {
+        {"Access-Control-Allow-Origin", "*"},
+        {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+        {"Access-Control-Allow-Headers", "Content-Type, Accept"},
+        {"Access-Control-Expose-Headers", "X-Audio-Format, X-Audio-Sample-Rate, X-Audio-Channels"},
+        {"Access-Control-Max-Age", "86400"},
+    };
 }
 
 class SocketRuntime {
@@ -222,6 +234,9 @@ std::string serialize_response(const HttpResponse & response) {
         << "Content-Type: " << response.content_type << "\r\n"
         << "Content-Length: " << response.body.size() << "\r\n"
         << "Connection: close\r\n";
+    for (const auto & [key, value] : cors_headers()) {
+        out << key << ": " << value << "\r\n";
+    }
     for (const auto & [key, value] : response.headers) {
         out << key << ": " << value << "\r\n";
     }
@@ -229,6 +244,10 @@ std::string serialize_response(const HttpResponse & response) {
     std::string header = out.str();
     header += response.body;
     return header;
+}
+
+SocketHandle responder_socket(std::uintptr_t socket) {
+    return static_cast<SocketHandle>(socket);
 }
 
 UniqueSocket bind_listen_socket(const std::string & host, int port) {
@@ -259,11 +278,23 @@ UniqueSocket bind_listen_socket(const std::string & host, int port) {
 
 void handle_client(SocketHandle client, IHttpHandler & handler) {
     UniqueSocket socket(client);
+    HttpResponder responder(static_cast<std::uintptr_t>(socket.get()));
     try {
         const auto request = read_http_request(socket.get());
+        if (request.method == "OPTIONS") {
+            send_all(socket.get(), serialize_response(HttpResponse{204, "text/plain", "", {}}));
+            return;
+        }
+        if (handler.handle_stream(request, responder)) {
+            return;
+        }
         const auto response = handler.handle(request);
         send_all(socket.get(), serialize_response(response));
     } catch (const std::exception & ex) {
+        if (responder.headers_sent()) {
+            std::cerr << "audiocpp_server streaming response failed: " << ex.what() << "\n";
+            return;
+        }
         try {
             send_all(socket.get(), serialize_response(error_response(500, ex.what(), "server_error")));
         } catch (const std::exception & send_error) {
@@ -282,6 +313,74 @@ HttpResponse error_response(int status, const std::string & message, const std::
     const std::string body = std::string("{\"error\":{\"message\":") + json_quote(message) +
         ",\"type\":" + json_quote(type) + "}}";
     return json_response(body, status);
+}
+
+HttpResponder::HttpResponder(std::uintptr_t socket)
+    : socket_(socket) {}
+
+bool HttpResponder::headers_sent() const noexcept {
+    return headers_sent_;
+}
+
+void HttpResponder::send_response(
+    int status,
+    std::string content_type,
+    std::string body,
+    std::unordered_map<std::string, std::string> headers) {
+    if (headers_sent_) {
+        throw std::runtime_error("HTTP response headers were already sent");
+    }
+    HttpResponse response{status, std::move(content_type), std::move(body), std::move(headers)};
+    send_all(responder_socket(socket_), serialize_response(response));
+    headers_sent_ = true;
+}
+
+void HttpResponder::start_chunked(
+    int status,
+    std::string content_type,
+    std::unordered_map<std::string, std::string> headers) {
+    if (headers_sent_) {
+        throw std::runtime_error("HTTP response headers were already sent");
+    }
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << " " << status_text(status) << "\r\n"
+        << "Content-Type: " << content_type << "\r\n"
+        << "Transfer-Encoding: chunked\r\n"
+        << "Connection: close\r\n";
+    for (const auto & [key, value] : cors_headers()) {
+        out << key << ": " << value << "\r\n";
+    }
+    for (const auto & [key, value] : headers) {
+        out << key << ": " << value << "\r\n";
+    }
+    out << "\r\n";
+    send_all(responder_socket(socket_), out.str());
+    headers_sent_ = true;
+    chunked_ = true;
+}
+
+void HttpResponder::send_chunk(std::string_view data) {
+    if (!chunked_) {
+        throw std::runtime_error("HTTP chunked response has not been started");
+    }
+    std::ostringstream out;
+    out << std::hex << data.size() << "\r\n";
+    std::string chunk = out.str();
+    chunk.append(data.data(), data.size());
+    chunk.append("\r\n");
+    send_all(responder_socket(socket_), chunk);
+}
+
+void HttpResponder::finish_chunked() {
+    if (!chunked_) {
+        return;
+    }
+    send_all(responder_socket(socket_), "0\r\n\r\n");
+    chunked_ = false;
+}
+
+bool IHttpHandler::handle_stream(const HttpRequest &, HttpResponder &) {
+    return false;
 }
 
 void serve_http(const std::string & host, int port, IHttpHandler & handler) {

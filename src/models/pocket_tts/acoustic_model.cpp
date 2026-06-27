@@ -126,7 +126,8 @@ AcousticModelResult AcousticModel::generate(
     const models::pocket_tts::PocketTTSBackendWeights & weights,
     const std::vector<float> & text_embeddings,
     const FlowLMState & initial_state,
-    const AcousticGenerationConfig & config) const {
+    const AcousticGenerationConfig & config,
+    AcousticLatentCallback on_latent) const {
     (void) manifest;
     (void) weights;
     if (config.max_steps <= 0) {
@@ -202,6 +203,9 @@ AcousticModelResult AcousticModel::generate(
             result.latents.insert(result.latents.end(), step_result.next_latent.begin(), step_result.next_latent.end());
             current_input = step_result.next_latent;
             result.generated_steps += 1;
+            if (on_latent && !on_latent(step_result.next_latent, step_result.eos_logit, step)) {
+                break;
+            }
         }
         const auto flow_timing = flow_lm_.runtime_timing(*runtime.step_runtime);
         engine::debug::timing_log_scalar("pocket_tts.flow_lm.prompt.host_setup_ms", flow_timing.prompt_host_setup_ms);

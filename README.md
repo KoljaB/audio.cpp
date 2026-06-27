@@ -462,6 +462,7 @@ The server exposes:
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/audio/speech`
+- `POST /v1/audio/speech/stream`
 - `POST /v1/audio/transcriptions`
 - `POST /v1/tasks/run`
 

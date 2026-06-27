@@ -120,6 +120,9 @@ void apply_generation_options(
     if (const auto embedding_path = runtime::find_option(options, {"voice_embedding_path"})) {
         generation_request.voice.embedding_path = *embedding_path;
     }
+    if (const auto clone_audio_path = runtime::find_option(options, {"voice_ref_path", "voice_clone_path", "clone_audio_path"})) {
+        generation_request.voice.clone_audio_path = *clone_audio_path;
+    }
     if (const auto clone_text = runtime::find_option(options, {"voice_clone_text"})) {
         generation_request.voice.clone_prompt_text = *clone_text;
     }
@@ -451,8 +454,8 @@ PocketTTSSession::PocketTTSSession(
     if (task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("PocketTTS only supports VoiceTaskKind::Tts");
     }
-    if (task_.mode != runtime::RunMode::Offline) {
-        throw std::runtime_error("PocketTTS only supports offline mode");
+    if (task_.mode != runtime::RunMode::Offline && task_.mode != runtime::RunMode::Streaming) {
+        throw std::runtime_error("PocketTTS only supports offline or streaming-output mode");
     }
     if (graph_capacity_.prompt_mode == runtime::GraphCapacityMode::Unsupported
         || graph_capacity_.generation_mode == runtime::GraphCapacityMode::Unsupported) {
@@ -738,6 +741,48 @@ runtime::TaskResult PocketTTSSession::run(const runtime::TaskRequest & request) 
     return result;
 }
 
+runtime::TaskResult PocketTTSSession::run_streaming_output(
+    const runtime::TaskRequest & request,
+    runtime::StreamEventCallback on_event) {
+    require_prepared("PocketTTS run_streaming_output()");
+    runtime::TaskRequest effective_request = request;
+    effective_request.voice.reset();
+    GenerationRequest generation_request = build_generation_request(effective_request);
+    generation_request.max_steps = prepared_session_request_.max_steps;
+    generation_request.max_tokens = prepared_session_request_.max_tokens;
+    generation_request.temperature = prepared_session_request_.temperature;
+    generation_request.noise_clamp = prepared_session_request_.noise_clamp;
+    generation_request.eos_threshold = prepared_session_request_.eos_threshold;
+    generation_request.seed = prepared_session_request_.seed;
+    generation_request.noise_schedule = prepared_session_request_.noise_schedule;
+    generation_request.noise_schedule_path = prepared_session_request_.noise_schedule_path;
+    generation_request.voice = prepared_session_request_.voice;
+
+    const GenerationResult generated = generate(
+        generation_request,
+        [&](const runtime::AudioBuffer & chunk) {
+            if (!on_event) {
+                return true;
+            }
+            runtime::StreamEvent event;
+            event.audio_output = chunk;
+            return on_event(event);
+        });
+    if (on_event) {
+        runtime::StreamEvent final_event;
+        final_event.is_final = true;
+        (void) on_event(final_event);
+    }
+
+    runtime::TaskResult result;
+    result.audio_output = runtime::AudioBuffer{
+        generated.sample_rate,
+        1,
+        generated.audio,
+    };
+    return result;
+}
+
 void PocketTTSSession::prepare_generation(const GenerationRequest & request) {
     if (!manifest_) {
         throw std::runtime_error("PocketTTS session is missing model assets");
@@ -776,7 +821,9 @@ void PocketTTSSession::prepare_generation(const GenerationRequest & request) {
     }
 }
 
-GenerationResult PocketTTSSession::generate(const GenerationRequest & request) {
+GenerationResult PocketTTSSession::generate(
+    const GenerationRequest & request,
+    std::function<bool(const runtime::AudioBuffer & chunk)> on_audio_chunk) {
     validate_generation_request(request);
     if (!manifest_) {
         throw std::runtime_error("PocketTTS session is missing model assets");
@@ -801,8 +848,12 @@ GenerationResult PocketTTSSession::generate(const GenerationRequest & request) {
     double acoustic_prepare_ms = 0.0;
     double acoustic_generate_ms = 0.0;
     double audio_decode_ms = 0.0;
+    bool keep_streaming = true;
 
     for (const auto & chunk : chunks) {
+        if (!keep_streaming) {
+            break;
+        }
         TextConditioningResult text_state;
         text_conditioner_ms += engine::debug::measure_ms([&]() {
             text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
@@ -833,31 +884,70 @@ GenerationResult PocketTTSSession::generate(const GenerationRequest & request) {
                 graph_capacity_.flow_step_graph_context_bytes);
         });
         AcousticModelResult acoustic;
-        acoustic_generate_ms += engine::debug::measure_ms([&]() {
-            acoustic = acoustic_model_.generate(
-                acoustic_runtime,
-                manifest,
-                *weights_,
-                text_state.text_embeddings,
-                voice_state.acoustic_state,
-                acoustic_config);
-        });
         std::vector<float> chunk_audio;
-        audio_decode_ms += engine::debug::measure_ms([&]() {
-            chunk_audio = audio_decoder_.decode(
-                execution_context().backend(),
-                options().backend.threads,
-                manifest,
-                *weights_,
-                acoustic.latents,
-                acoustic.generated_steps,
-                graph_capacity_.mimi_conv_graph_context_bytes,
-                graph_capacity_.mimi_transformer_graph_context_bytes,
-                graph_capacity_.mimi_tail_graph_context_bytes,
-                graph_capacity_.mimi_full_chunk_frames,
-                graph_capacity_.mimi_stage2_chunk_frames,
-                graph_capacity_.mimi_use_full_sequence_path);
-        });
+        if (on_audio_chunk) {
+            auto decoder_stream = audio_decoder_.create_stream();
+            double stream_callback_ms = 0.0;
+            const double generate_with_stream_ms = engine::debug::measure_ms([&]() {
+                acoustic = acoustic_model_.generate(
+                    acoustic_runtime,
+                    manifest,
+                    *weights_,
+                    text_state.text_embeddings,
+                    voice_state.acoustic_state,
+                    acoustic_config,
+                    [&](const std::vector<float> & latent, float, int) {
+                        stream_callback_ms += engine::debug::measure_ms([&]() {
+                            auto samples = audio_decoder_.decode_streaming_step(
+                                execution_context().backend(),
+                                options().backend.threads,
+                                manifest,
+                                *weights_,
+                                decoder_stream,
+                                latent,
+                                graph_capacity_.mimi_conv_graph_context_bytes,
+                                graph_capacity_.mimi_transformer_graph_context_bytes,
+                                graph_capacity_.mimi_tail_graph_context_bytes);
+                            if (!samples.empty()) {
+                                chunk_audio.insert(chunk_audio.end(), samples.begin(), samples.end());
+                                runtime::AudioBuffer audio_chunk;
+                                audio_chunk.sample_rate = manifest.model_config.sample_rate;
+                                audio_chunk.channels = 1;
+                                audio_chunk.samples = std::move(samples);
+                                keep_streaming = on_audio_chunk(audio_chunk);
+                            }
+                        });
+                        return keep_streaming;
+                    });
+            });
+            acoustic_generate_ms += std::max(0.0, generate_with_stream_ms - stream_callback_ms);
+            audio_decode_ms += stream_callback_ms;
+        } else {
+            acoustic_generate_ms += engine::debug::measure_ms([&]() {
+                acoustic = acoustic_model_.generate(
+                    acoustic_runtime,
+                    manifest,
+                    *weights_,
+                    text_state.text_embeddings,
+                    voice_state.acoustic_state,
+                    acoustic_config);
+            });
+            audio_decode_ms += engine::debug::measure_ms([&]() {
+                chunk_audio = audio_decoder_.decode(
+                    execution_context().backend(),
+                    options().backend.threads,
+                    manifest,
+                    *weights_,
+                    acoustic.latents,
+                    acoustic.generated_steps,
+                    graph_capacity_.mimi_conv_graph_context_bytes,
+                    graph_capacity_.mimi_transformer_graph_context_bytes,
+                    graph_capacity_.mimi_tail_graph_context_bytes,
+                    graph_capacity_.mimi_full_chunk_frames,
+                    graph_capacity_.mimi_stage2_chunk_frames,
+                    graph_capacity_.mimi_use_full_sequence_path);
+            });
+        }
         audio.insert(audio.end(), chunk_audio.begin(), chunk_audio.end());
     }
 

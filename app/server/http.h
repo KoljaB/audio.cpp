@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace minitts::server {
@@ -19,9 +21,36 @@ struct HttpResponse {
     std::unordered_map<std::string, std::string> headers;
 };
 
+class HttpResponder {
+public:
+    explicit HttpResponder(std::uintptr_t socket);
+
+    HttpResponder(const HttpResponder &) = delete;
+    HttpResponder & operator=(const HttpResponder &) = delete;
+
+    bool headers_sent() const noexcept;
+    void send_response(
+        int status,
+        std::string content_type,
+        std::string body,
+        std::unordered_map<std::string, std::string> headers = {});
+    void start_chunked(
+        int status,
+        std::string content_type,
+        std::unordered_map<std::string, std::string> headers = {});
+    void send_chunk(std::string_view data);
+    void finish_chunked();
+
+private:
+    std::uintptr_t socket_ = 0;
+    bool headers_sent_ = false;
+    bool chunked_ = false;
+};
+
 class IHttpHandler {
 public:
     virtual ~IHttpHandler() = default;
+    virtual bool handle_stream(const HttpRequest & request, HttpResponder & responder);
     virtual HttpResponse handle(const HttpRequest & request) = 0;
 };
 

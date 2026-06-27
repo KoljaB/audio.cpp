@@ -36,6 +36,7 @@ void print_help() {
         << "  GET  /health\n"
         << "  GET  /v1/models\n"
         << "  POST /v1/audio/speech\n"
+        << "  POST /v1/audio/speech/stream\n"
         << "  POST /v1/audio/transcriptions\n"
         << "  POST /v1/tasks/run\n";
 }

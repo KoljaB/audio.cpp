@@ -9,6 +9,7 @@
 #include "engine/models/pocket_tts/voice_conditioner.h"
 
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 
@@ -37,7 +38,8 @@ struct PocketTTSGraphCapacityConfig {
 
 class PocketTTSSession final
     : public runtime::RuntimeSessionBase
-    , public runtime::IOfflineVoiceTaskSession {
+    , public runtime::IOfflineVoiceTaskSession
+    , public runtime::IStreamingOutputVoiceTaskSession {
 public:
     PocketTTSSession(
         runtime::TaskSpec task,
@@ -54,9 +56,14 @@ public:
     runtime::RunMode run_mode() const override;
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
+    runtime::TaskResult run_streaming_output(
+        const runtime::TaskRequest & request,
+        runtime::StreamEventCallback on_event) override;
 
     void prepare_generation(const GenerationRequest & request);
-    GenerationResult generate(const GenerationRequest & request);
+    GenerationResult generate(
+        const GenerationRequest & request,
+        std::function<bool(const runtime::AudioBuffer & chunk)> on_audio_chunk = {});
     FlowLMState prepare_voice_state(const VoiceConfig & voice);
     void export_voice_state(const VoiceConfig & voice, const std::filesystem::path & destination);
 

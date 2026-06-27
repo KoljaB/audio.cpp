@@ -190,6 +190,8 @@ struct StreamEvent {
     bool is_final = false;
 };
 
+using StreamEventCallback = std::function<bool(const StreamEvent & event)>;
+
 class IVoiceTaskSession {
 public:
     virtual ~IVoiceTaskSession() = default;
@@ -205,6 +207,15 @@ public:
     ~IOfflineVoiceTaskSession() override = default;
 
     virtual TaskResult run(const TaskRequest & request) = 0;
+};
+
+class IStreamingOutputVoiceTaskSession : public virtual IVoiceTaskSession {
+public:
+    ~IStreamingOutputVoiceTaskSession() override = default;
+
+    virtual TaskResult run_streaming_output(
+        const TaskRequest & request,
+        StreamEventCallback on_event) = 0;
 };
 
 class IStreamingVoiceTaskSession : public virtual IVoiceTaskSession {

@@ -19,6 +19,7 @@ class ServerState final : public IHttpHandler {
 public:
     ServerState(ServerConfig config, std::filesystem::path request_base);
 
+    bool handle_stream(const HttpRequest & request, HttpResponder & responder) override;
     HttpResponse handle(const HttpRequest & request) override;
 
 private:
@@ -28,6 +29,7 @@ private:
         std::unique_ptr<engine::runtime::ILoadedVoiceModel> model;
         std::unique_ptr<engine::runtime::IVoiceTaskSession> session;
         engine::runtime::IOfflineVoiceTaskSession * offline = nullptr;
+        engine::runtime::IStreamingOutputVoiceTaskSession * streaming_output = nullptr;
         std::mutex mutex;
     };
 
@@ -35,6 +37,7 @@ private:
     LoadedModel & require_model(const engine::io::json::Value & body);
     engine::runtime::TaskResult run_model(LoadedModel & model, const engine::runtime::TaskRequest & request);
     HttpResponse handle_speech(const std::string & body_text);
+    void handle_speech_stream(const std::string & body_text, HttpResponder & responder);
     HttpResponse handle_transcription(const std::string & body_text);
     HttpResponse handle_generic_run(const std::string & body_text);
     std::string models_json() const;

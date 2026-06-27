@@ -25,6 +25,41 @@ std::vector<float> denormalize_latents(
 
 AudioDecoder::AudioDecoder(MimiDecoderConfig config) : decoder_(std::move(config)) {}
 
+MimiDecoderStream AudioDecoder::create_stream() const {
+    return decoder_.create_stream();
+}
+
+std::vector<float> AudioDecoder::decode_streaming_step(
+    ggml_backend_t backend,
+    int threads,
+    const PocketTTSAssets & manifest,
+    const PocketTTSBackendWeights & weights,
+    MimiDecoderStream & stream,
+    const std::vector<float> & latent,
+    size_t conv_graph_context_bytes,
+    size_t transformer_graph_context_bytes,
+    size_t tail_graph_context_bytes) const {
+    if (latent.size() != static_cast<size_t>(decoder_.config().latent_size)) {
+        throw std::runtime_error("PocketTTS streaming audio decoder latent size does not match latent_size");
+    }
+    const auto & emb_mean = weights.host.emb_mean;
+    const auto & emb_std = weights.host.emb_std;
+    if (emb_mean.size() != emb_std.size() || emb_mean.size() != static_cast<size_t>(decoder_.config().latent_size)) {
+        throw std::runtime_error("PocketTTS latent normalization stats must match Mimi latent_size");
+    }
+    auto denormalized = denormalize_latents(latent, emb_mean, emb_std);
+    return decoder_.decode_streaming_step(
+        backend,
+        threads,
+        manifest,
+        weights,
+        stream,
+        denormalized,
+        conv_graph_context_bytes,
+        transformer_graph_context_bytes,
+        tail_graph_context_bytes);
+}
+
 std::vector<float> AudioDecoder::decode(
     ggml_backend_t backend,
     int threads,
@@ -37,7 +72,8 @@ std::vector<float> AudioDecoder::decode(
     size_t tail_graph_context_bytes,
     int64_t full_chunk_frames,
     int64_t stage2_chunk_frames,
-    bool use_full_sequence_path) const {
+    bool use_full_sequence_path,
+    AudioSamplesCallback on_audio_samples) const {
     if (steps <= 0) {
         throw std::runtime_error("PocketTTS audio decoder requires positive step count");
     }
@@ -62,7 +98,8 @@ std::vector<float> AudioDecoder::decode(
         tail_graph_context_bytes,
         full_chunk_frames,
         stage2_chunk_frames,
-        use_full_sequence_path);
+        use_full_sequence_path,
+        std::move(on_audio_samples));
 }
 
 void AudioDecoder::clear_runtime_cache() const noexcept {

@@ -144,7 +144,7 @@ public:
         inspection.metadata.config_candidates = {"config.yaml", "config.yml"};
         inspection.metadata.weight_candidates = {"model.safetensors"};
         inspection.capabilities.supported_tasks = {
-            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
+            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
         };
         inspection.capabilities.languages = discover_languages(root);
         inspection.capabilities.supports_speaker_reference = true;
@@ -227,7 +227,7 @@ std::unique_ptr<PocketTTSLoadedModel> load_pocket_tts_model(const runtime::Model
 
     runtime::CapabilitySet capabilities;
     capabilities.supported_tasks = {
-        {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
+        {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
     };
     capabilities.languages = discover_languages(resolve_model_root(request.model_path));
     capabilities.supports_speaker_reference = true;

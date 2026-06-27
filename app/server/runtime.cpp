@@ -6,6 +6,7 @@
 #include "engine/framework/runtime/registry.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -38,6 +39,28 @@ void add_option_from_json(
     if (value != nullptr && !value->is_null()) {
         options[option_key] = minitts::cli::json_option_string(*value);
     }
+}
+
+engine::core::BackendType parse_backend_type(std::string backend) {
+    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (backend == "cpu") {
+        return engine::core::BackendType::Cpu;
+    }
+    if (backend == "cuda" || backend == "gpu") {
+        return engine::core::BackendType::Cuda;
+    }
+    if (backend == "vulkan") {
+        return engine::core::BackendType::Vulkan;
+    }
+    if (backend == "metal") {
+        return engine::core::BackendType::Metal;
+    }
+    if (backend == "best" || backend == "auto") {
+        return engine::core::BackendType::BestAvailable;
+    }
+    throw std::runtime_error("unsupported server backend: " + backend);
 }
 
 std::vector<uint8_t> encode_pcm16_wav(const engine::runtime::AudioBuffer & audio) {
@@ -83,6 +106,20 @@ std::vector<uint8_t> encode_pcm16_wav(const engine::runtime::AudioBuffer & audio
         sample = std::max(-1.0F, std::min(1.0F, sample));
         const auto pcm = static_cast<int16_t>(std::lrint(sample * 32767.0F));
         append_bytes(&pcm, sizeof(pcm));
+    }
+    return out;
+}
+
+std::string encode_pcm16_payload(const engine::runtime::AudioBuffer & audio) {
+    if (audio.channels <= 0) {
+        throw std::runtime_error("audio output channel count must be positive");
+    }
+    std::string out;
+    out.reserve(audio.samples.size() * sizeof(int16_t));
+    for (float sample : audio.samples) {
+        sample = std::max(-1.0F, std::min(1.0F, sample));
+        const auto pcm = static_cast<int16_t>(std::lrint(sample * 32767.0F));
+        out.append(reinterpret_cast<const char *>(&pcm), sizeof(pcm));
     }
     return out;
 }
@@ -220,13 +257,16 @@ engine::runtime::TaskRequest build_openai_speech_request(const Value & body, con
 
     engine::runtime::VoiceCondition voice;
     bool has_voice = false;
+    std::string voice_ref_path_option;
     if (const auto * value = body.find("voice")) {
         engine::runtime::VoiceReference reference;
         reference.cached_voice_id = value->as_string();
         voice.speaker = std::move(reference);
         has_voice = true;
     }
-    if (const auto * value = body.find("voice_ref")) {
+    if (const auto * value = body.find("voice_ref_path")) {
+        voice_ref_path_option = resolve_path(base_dir, value->as_string()).string();
+    } else if (const auto * value = body.find("voice_ref")) {
         if (!voice.speaker.has_value()) {
             voice.speaker = engine::runtime::VoiceReference{};
         }
@@ -247,6 +287,9 @@ engine::runtime::TaskRequest build_openai_speech_request(const Value & body, con
     add_option_from_json(request.options, body, "repetition_penalty", "repetition_penalty");
     add_option_from_json(request.options, body, "guidance_scale", "guidance_scale");
     add_option_from_json(request.options, body, "num_inference_steps", "num_inference_steps");
+    if (!voice_ref_path_option.empty()) {
+        request.options["voice_ref_path"] = voice_ref_path_option;
+    }
     if (const auto * value = body.find("instructions")) {
         request.options["instruct"] = value->as_string();
     }
@@ -285,9 +328,19 @@ ServerState::ServerState(ServerConfig config, std::filesystem::path request_base
     load_models();
 }
 
+bool ServerState::handle_stream(const HttpRequest & request, HttpResponder & responder) {
+    if (request.method == "POST" && request.path == "/v1/audio/speech/stream") {
+        handle_speech_stream(request.body, responder);
+        return true;
+    }
+    return false;
+}
+
 HttpResponse ServerState::handle(const HttpRequest & request) {
     if (request.method == "GET" && request.path == "/health") {
-        return json_response("{\"status\":\"ok\",\"backend\":\"cuda\",\"models\":" + std::to_string(models_.size()) + "}");
+        return json_response(
+            "{\"status\":\"ok\",\"backend\":" + json_quote(config_.backend) +
+            ",\"models\":" + std::to_string(models_.size()) + "}");
     }
     if (request.method == "GET" && request.path == "/v1/models") {
         return json_response(models_json());
@@ -315,7 +368,7 @@ void ServerState::load_models() {
         load_request.options = config.load_options;
 
         engine::runtime::SessionOptions session_options;
-        session_options.backend.type = engine::core::BackendType::Cuda;
+        session_options.backend.type = parse_backend_type(config_.backend);
         session_options.backend.device = config_.device;
         session_options.backend.threads = config_.threads;
         session_options.options = config.session_options;
@@ -326,14 +379,13 @@ void ServerState::load_models() {
             engine::runtime::parse_voice_task_kind(loaded->config.task),
             engine::runtime::parse_run_mode(loaded->config.mode),
         };
-        if (loaded->task.mode != engine::runtime::RunMode::Offline) {
-            throw std::runtime_error("audiocpp_server currently requires offline model sessions");
-        }
         loaded->model = registry.load(load_request);
         loaded->session = loaded->model->create_task_session(loaded->task, session_options);
         loaded->offline = dynamic_cast<engine::runtime::IOfflineVoiceTaskSession *>(loaded->session.get());
-        if (loaded->offline == nullptr) {
-            throw std::runtime_error("configured model does not provide offline execution: " + loaded->config.id);
+        loaded->streaming_output =
+            dynamic_cast<engine::runtime::IStreamingOutputVoiceTaskSession *>(loaded->session.get());
+        if (loaded->offline == nullptr && loaded->streaming_output == nullptr) {
+            throw std::runtime_error("configured model provides no server-compatible execution path: " + loaded->config.id);
         }
         if (!model_index_.emplace(loaded->config.id, models_.size()).second) {
             throw std::runtime_error("duplicate server model id: " + loaded->config.id);
@@ -354,6 +406,9 @@ ServerState::LoadedModel & ServerState::require_model(const Value & body) {
 engine::runtime::TaskResult ServerState::run_model(
     LoadedModel & model,
     const engine::runtime::TaskRequest & request) {
+    if (model.offline == nullptr) {
+        throw std::runtime_error("configured model does not provide offline execution: " + model.config.id);
+    }
     std::lock_guard<std::mutex> lock(model.mutex);
     model.session->prepare(engine::runtime::build_preparation_request(request));
     return model.offline->run(request);
@@ -370,6 +425,54 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
         return json_response("{\"audio\":" + json_quote(base64_encode(wav)) + ",\"format\":\"wav\"}");
     }
     return HttpResponse{200, "audio/wav", std::string(reinterpret_cast<const char *>(wav.data()), wav.size()), {}};
+}
+
+void ServerState::handle_speech_stream(const std::string & body_text, HttpResponder & responder) {
+    const auto body = engine::io::json::parse(body_text);
+    auto & model = require_model(body);
+    if (model.streaming_output == nullptr) {
+        const auto response = error_response(
+            400,
+            "configured model does not provide streaming output: " + model.config.id,
+            "unsupported_model");
+        responder.send_response(response.status, response.content_type, response.body, response.headers);
+        return;
+    }
+
+    const auto request = build_openai_speech_request(body, request_base_);
+    bool started = false;
+    std::lock_guard<std::mutex> lock(model.mutex);
+    model.session->prepare(engine::runtime::build_preparation_request(request));
+    (void) model.streaming_output->run_streaming_output(
+        request,
+        [&](const engine::runtime::StreamEvent & event) {
+            if (!event.audio_output.has_value()) {
+                return true;
+            }
+            const auto & audio = *event.audio_output;
+            const auto chunk = encode_pcm16_payload(audio);
+            if (chunk.empty()) {
+                return true;
+            }
+            if (!started) {
+                responder.start_chunked(
+                    200,
+                    "application/octet-stream",
+                    {
+                        {"X-Audio-Format", "pcm_s16le"},
+                        {"X-Audio-Sample-Rate", std::to_string(audio.sample_rate)},
+                        {"X-Audio-Channels", std::to_string(audio.channels)},
+                    });
+                started = true;
+            }
+            responder.send_chunk(chunk);
+            return true;
+        });
+    if (started) {
+        responder.finish_chunked();
+    } else {
+        responder.send_response(204, "application/octet-stream", "");
+    }
 }
 
 HttpResponse ServerState::handle_transcription(const std::string & body_text) {

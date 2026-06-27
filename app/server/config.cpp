@@ -26,6 +26,7 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
     ServerConfig config;
     config.host = engine::io::json::optional_string(root, "host", config.host);
     config.port = engine::io::json::optional_i32(root, "port", config.port);
+    config.backend = engine::io::json::optional_string(root, "backend", config.backend);
     config.device = engine::io::json::optional_i32(root, "device", config.device);
     config.threads = engine::io::json::optional_i32(root, "threads", config.threads);
     if (config.port <= 0 || config.port > 65535) {

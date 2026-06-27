@@ -23,6 +23,7 @@ struct ServerModelConfig {
 struct ServerConfig {
     std::string host = "127.0.0.1";
     int port = 8080;
+    std::string backend = "cuda";
     int device = 0;
     int threads = 1;
     std::vector<ServerModelConfig> models;
