@@ -12,6 +12,8 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace engine::models::pocket_tts {
 
@@ -73,6 +75,13 @@ private:
         int generation_capacity = 0;
     };
 
+    struct PreparedChunkRuntime {
+        std::string text;
+        TextConditioningResult text_state;
+        AcousticGenerationConfig acoustic_config;
+        AcousticPreparedRuntime acoustic_runtime;
+    };
+
     FlowLMState resolve_prepared_voice_state(const VoiceConditioningPlan & plan);
     PocketTTSGraphCapacityConfig resolve_graph_capacity_config() const;
     runtime::MappedGraphCapacityAdapter make_prompt_capacity_adapter() const;
@@ -92,6 +101,8 @@ private:
     AudioDecoder audio_decoder_;
     std::map<std::string, FlowLMState> cached_voice_states_;
     GenerationRequest prepared_session_request_;
+    std::string prepared_generation_voice_key_;
+    std::vector<PreparedChunkRuntime> prepared_chunk_runtimes_;
     runtime::GraphCapacityController prompt_capacity_controller_;
     runtime::GraphCapacityController generation_capacity_controller_;
 };

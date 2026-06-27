@@ -245,6 +245,22 @@ void validate_generation_request(const GenerationRequest & request) {
     }
 }
 
+bool prepared_generation_request_matches(
+    const GenerationRequest & prepared,
+    const GenerationRequest & request) {
+    return prepared.text == request.text
+        && prepared.max_steps == request.max_steps
+        && prepared.max_tokens == request.max_tokens
+        && prepared.text_chunk_size == request.text_chunk_size
+        && prepared.frames_after_eos == request.frames_after_eos
+        && prepared.temperature == request.temperature
+        && prepared.noise_clamp == request.noise_clamp
+        && prepared.eos_threshold == request.eos_threshold
+        && prepared.seed == request.seed
+        && prepared.noise_schedule == request.noise_schedule
+        && prepared.noise_schedule_path == request.noise_schedule_path;
+}
+
 int estimate_max_steps(const PocketTTSAssets & manifest, int64_t token_count) {
     constexpr double kTokensPerSecondEstimate = 3.0;
     constexpr double kGenerationSecondsPadding = 2.0;
@@ -704,6 +720,8 @@ runtime::RunMode PocketTTSSession::run_mode() const {
 
 void PocketTTSSession::prepare(const runtime::SessionPreparationRequest & request) {
     prepared_session_request_ = build_preparation_generation_request(request);
+    prepared_generation_voice_key_.clear();
+    prepared_chunk_runtimes_.clear();
     if (!has_voice_selection(prepared_session_request_.voice)) {
         throw std::runtime_error(
             "PocketTTS session prepare() requires a session voice via --voice-id or --voice-ref");
@@ -787,7 +805,10 @@ void PocketTTSSession::prepare_generation(const GenerationRequest & request) {
     if (!manifest_) {
         throw std::runtime_error("PocketTTS session is missing model assets");
     }
+    prepared_generation_voice_key_.clear();
+    prepared_chunk_runtimes_.clear();
     const auto voice_plan = resolve_voice_conditioning_plan(model_dir_, request);
+    prepared_generation_voice_key_ = voice_state_cache_key(voice_plan);
     const FlowLMState voice_state = resolve_prepared_voice_state(voice_plan);
     if (request.text.empty()) {
         return;
@@ -796,28 +817,31 @@ void PocketTTSSession::prepare_generation(const GenerationRequest & request) {
     const int64_t text_chunk_size = request.text_chunk_size.value_or(kDefaultTextChunkSize);
     const auto chunks = engine::text::split_text_chunks(request.text, text_chunk_size);
     for (const auto & chunk : chunks) {
-        const TextConditioningResult text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
-        const AcousticGenerationConfig acoustic_config = resolve_acoustic_generation_config(
+        PreparedChunkRuntime prepared;
+        prepared.text = chunk;
+        prepared.text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
+        prepared.acoustic_config = resolve_acoustic_generation_config(
             manifest,
-            text_state,
+            prepared.text_state,
             request,
             acoustic_model_.config().latent_size);
         const int64_t prompt_steps = static_cast<int64_t>(
-            text_state.text_embeddings.size() / static_cast<size_t>(acoustic_model_.config().hidden_size));
-        const AcousticCapacitySelection capacities = select_acoustic_capacities(prompt_steps, acoustic_config.max_steps);
-        (void) acoustic_model_.prepare_runtime(
+            prepared.text_state.text_embeddings.size() / static_cast<size_t>(acoustic_model_.config().hidden_size));
+        const AcousticCapacitySelection capacities = select_acoustic_capacities(prompt_steps, prepared.acoustic_config.max_steps);
+        prepared.acoustic_runtime = acoustic_model_.prepare_runtime(
             execution_context().backend(),
             options().backend.threads,
             manifest,
             *weights_,
-            text_state.text_embeddings,
+            prepared.text_state.text_embeddings,
             voice_state,
-            acoustic_config,
+            prepared.acoustic_config,
             capacities.prompt_capacity,
             voice_state.current_end,
             capacities.generation_capacity,
             graph_capacity_.flow_weights_view_context_bytes,
             graph_capacity_.flow_step_graph_context_bytes);
+        prepared_chunk_runtimes_.push_back(std::move(prepared));
     }
 }
 
@@ -836,6 +860,15 @@ GenerationResult PocketTTSSession::generate(
     engine::debug::trace_log_scalar("pocket_tts.text_chunk_size", text_chunk_size);
     engine::debug::trace_log_scalar("pocket_tts.text_chunk_count", static_cast<int64_t>(chunks.size()));
     const auto voice_plan = resolve_voice_conditioning_plan(model_dir_, request);
+    std::vector<PreparedChunkRuntime> prepared_chunks;
+    if (!prepared_chunk_runtimes_.empty()
+        && prepared_generation_voice_key_ == voice_state_cache_key(voice_plan)
+        && prepared_generation_request_matches(prepared_session_request_, request)
+        && prepared_chunk_runtimes_.size() == chunks.size()) {
+        prepared_chunks = std::move(prepared_chunk_runtimes_);
+    }
+    prepared_generation_voice_key_.clear();
+    prepared_chunk_runtimes_.clear();
 
     VoiceConditioningResult voice_state;
     const double voice_conditioner_ms = engine::debug::measure_ms([&]() {
@@ -850,39 +883,50 @@ GenerationResult PocketTTSSession::generate(
     double audio_decode_ms = 0.0;
     bool keep_streaming = true;
 
-    for (const auto & chunk : chunks) {
+    for (size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
+        const auto & chunk = chunks[chunk_index];
         if (!keep_streaming) {
             break;
         }
         TextConditioningResult text_state;
-        text_conditioner_ms += engine::debug::measure_ms([&]() {
-            text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
-        });
-        const AcousticGenerationConfig acoustic_config = resolve_acoustic_generation_config(
-            manifest,
-            text_state,
-            request,
-            acoustic_model_.config().latent_size);
-        const int64_t prompt_steps = static_cast<int64_t>(
-            text_state.text_embeddings.size() / static_cast<size_t>(acoustic_model_.config().hidden_size));
-        const AcousticCapacitySelection capacities = select_acoustic_capacities(prompt_steps, acoustic_config.max_steps);
-
         AcousticPreparedRuntime acoustic_runtime;
-        acoustic_prepare_ms += engine::debug::measure_ms([&]() {
-            acoustic_runtime = acoustic_model_.prepare_runtime(
-                execution_context().backend(),
-                options().backend.threads,
+        AcousticGenerationConfig acoustic_config;
+        const bool use_prepared =
+            chunk_index < prepared_chunks.size()
+            && prepared_chunks[chunk_index].text == chunk;
+        if (use_prepared) {
+            text_state = std::move(prepared_chunks[chunk_index].text_state);
+            acoustic_config = std::move(prepared_chunks[chunk_index].acoustic_config);
+            acoustic_runtime = std::move(prepared_chunks[chunk_index].acoustic_runtime);
+        } else {
+            text_conditioner_ms += engine::debug::measure_ms([&]() {
+                text_state = text_conditioner_.prepare(manifest, weights_->host, chunk);
+            });
+            acoustic_config = resolve_acoustic_generation_config(
                 manifest,
-                *weights_,
-                text_state.text_embeddings,
-                voice_state.acoustic_state,
-                acoustic_config,
-                capacities.prompt_capacity,
-                voice_state.acoustic_state.current_end,
-                capacities.generation_capacity,
-                graph_capacity_.flow_weights_view_context_bytes,
-                graph_capacity_.flow_step_graph_context_bytes);
-        });
+                text_state,
+                request,
+                acoustic_model_.config().latent_size);
+            const int64_t prompt_steps = static_cast<int64_t>(
+                text_state.text_embeddings.size() / static_cast<size_t>(acoustic_model_.config().hidden_size));
+            const AcousticCapacitySelection capacities = select_acoustic_capacities(prompt_steps, acoustic_config.max_steps);
+
+            acoustic_prepare_ms += engine::debug::measure_ms([&]() {
+                acoustic_runtime = acoustic_model_.prepare_runtime(
+                    execution_context().backend(),
+                    options().backend.threads,
+                    manifest,
+                    *weights_,
+                    text_state.text_embeddings,
+                    voice_state.acoustic_state,
+                    acoustic_config,
+                    capacities.prompt_capacity,
+                    voice_state.acoustic_state.current_end,
+                    capacities.generation_capacity,
+                    graph_capacity_.flow_weights_view_context_bytes,
+                    graph_capacity_.flow_step_graph_context_bytes);
+            });
+        }
         AcousticModelResult acoustic;
         std::vector<float> chunk_audio;
         if (on_audio_chunk) {
